@@ -1,0 +1,26 @@
+name: soccerstack
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - matplotlib
+  - pytorch
+  - torchvision
+  - pip:
+      - -r Co-DETR/requirements.txt
+      - -e ./Co-DETR
+      - boxmot
+      - -e ./parseq
+      - opencv-python
+      - tqdm
+      - pillow
+      - paddleocr
+      - huggingface_hub
+      - transformers
+      - onnxruntime
+      - gdown

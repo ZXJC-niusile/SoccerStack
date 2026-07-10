@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime config
+.env
+
+# IDE
+.idea/
+.vscode/
+
+# Runtime outputs and temp
+output/
+*.log
+
+# Model caches and large artifacts
+paddle_models/
+models/deepseek-vl-ocr/
+models/zzpm_weights/*.pth
+models/zzpm_weights/*.onnx
+models/zzpm_weights/*.pt
+
+# System
+.DS_Store

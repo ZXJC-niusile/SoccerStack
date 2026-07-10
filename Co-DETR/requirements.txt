@@ -1,0 +1,14 @@
+# These must be installed before building mmdetection
+cython
+numpy
+matplotlib
+pycocotools
+six
+terminaltables
+fairscale
+scipy
+yapf
+timm
+fvcore
+tensorboard
+einops
