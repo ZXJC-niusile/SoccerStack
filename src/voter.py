@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import traceback
@@ -30,6 +31,11 @@ class TrackVoter:
         parseq_checkpoint=None,
         use_deepseek_fallback=True,
         zzpm_weights_dir=DEFAULT_ZZPM_WEIGHTS_DIR,
+        identity_lock_min_frames=8,
+        identity_dominant_ratio=0.6,
+        kit_sat_min=60.0,
+        kit_val_min=55.0,
+        team_hue_sep=18.0,
         debug=False,
     ):
         self.debug = bool(debug)
@@ -80,6 +86,33 @@ class TrackVoter:
             self._init_zzpm_model()
         else:
             raise ValueError("recognizer_type 仅支持 'paddle'、'parseq' 或 'zzpm'")
+
+        # ---- Task 1.2: adaptive per-match team-color centroids ----
+        # HSV hue in OpenCV is on a 0..180 half-circle, so wrap distance is needed.
+        # We bootstrap two centroids from early saturated/bright torso crops, then
+        # do slow EMA updates as new observations arrive. Until both centroids are
+        # established we abstain (return "other") so hard-coded red/blue heuristics
+        # don't mislabel teams in away/home kit color swaps.
+        self._team_centroids = [None, None]
+        # Buffer for c0 seeding: wait for N strong observations and seed with the
+        # circular mean. Avoids poisoning c0 with a single yellow-card / ad-board
+        # outlier that happens to pass the sat/val filter.
+        self._c0_bootstrap_buffer = []
+        self._c0_bootstrap_required = max(2, int(os.getenv('TEAM_C0_BOOTSTRAP_N', '3')))
+        self._team_ema_alpha = 0.05
+        self._kit_sat_min = float(kit_sat_min)
+        self._kit_val_min = float(kit_val_min)
+        self._team_hue_sep = float(team_hue_sep)
+
+        # ---- Task 1.3: multi-frame debounce for non-player identities ----
+        # The previous code locked Referee/Coach on the FIRST matching frame,
+        # which made single-frame misclassifications (yellow ad boards, sideline
+        # shadows, lighting flips) permanent. Require both:
+        #   (a) at least `identity_lock_min_frames` matching observations, and
+        #   (b) matching observations dominate the track's vote counter
+        #       (>= `identity_dominant_ratio` of total frames seen) before locking.
+        self._identity_lock_min_frames = max(1, int(identity_lock_min_frames))
+        self._identity_dominant_ratio = float(identity_dominant_ratio)
 
     def _log(self, message):
         if self.debug:
@@ -189,15 +222,105 @@ class TrackVoter:
 
     @staticmethod
     def _classify_hsv_cluster(h, s, v):
+        # Static (centroid-independent) classification only.
+        # Team colors used to live here (red: h<=12|h>=168 s>=70 v>=55, blue:
+        # 90<=h<=140 s>=60 v>=45), but those hard-coded rules mislabeled every
+        # match whose home/away kits weren't red and blue. Team classification is
+        # now data-driven via _classify_team_hue below. We keep only the
+        # non-team neutrals here so the function still describes "is this a
+        # shirt-shaped color at all, or is it staff/referee/garbage?".
         if v < 45 and s < 55:
             return "staff"
-        if (h <= 12 or h >= 168) and s >= 70 and v >= 55:
-            return "team_red"
-        if 90 <= h <= 140 and s >= 60 and v >= 45:
-            return "team_blue"
-        if (18 <= h <= 42 and s >= 60 and v >= 70) or (v < 80 and s < 45):
+        # Yellow kits and referee shirts both live in the 18..42 hue band.
+        # We require high saturation+value to avoid catching warm beige fabric.
+        if 18 <= h <= 42 and s >= 60 and v >= 70:
             return "referee"
         return "other"
+
+    @staticmethod
+    def _hue_distance_circular(a, b):
+        # OpenCV HSV hue is on a 0..180 half-circle. Linear difference is wrong
+        # near the wrap-around (e.g. 179 vs 1 is actually 2 apart, not 178).
+        d = abs(float(a) - float(b)) % 180.0
+        return min(d, 180.0 - d)
+
+    def _update_team_centroid(self, slot, hue):
+        # Slow EMA so per-frame lighting flicker doesn't churn the centroid.
+        old = self._team_centroids[slot]
+        if old is None:
+            self._team_centroids[slot] = float(hue)
+            return
+        # Pick the shorter circular arc when averaging hues so we don't drift
+        # across the wrap-around (otherwise 179 and 1 would average to 90).
+        d = self._hue_distance_circular(old, hue)
+        if (hue - old) % 180.0 > 90.0:
+            new = (old - self._team_ema_alpha * d) % 180.0
+        else:
+            new = (old + self._team_ema_alpha * d) % 180.0
+        self._team_centroids[slot] = new
+
+    def _classify_team_hue(self, hue, sat, val):
+        # Bootstrap / classification for the two team centroids. Returns one of:
+        #   "team_red" (slot 0), "team_blue" (slot 1), or "other" (abstain).
+        # "team_red" / "team_blue" labels are kept for downstream rendering
+        # compatibility; the underlying colors are whatever the match actually
+        # wears (yellow/green/black/etc.) - the names are just slot indices.
+        if sat < self._kit_sat_min or val < self._kit_val_min:
+            return "other"
+
+        c0, c1 = self._team_centroids
+        if c0 is not None and c1 is not None:
+            d0 = self._hue_distance_circular(hue, c0)
+            d1 = self._hue_distance_circular(hue, c1)
+            slot = 0 if d0 <= d1 else 1
+            self._update_team_centroid(slot, hue)
+            return "team_red" if slot == 0 else "team_blue"
+
+        # Bootstrap c0: wait for N strong observations, seed with circular mean.
+        # Seeding from a single frame is fragile - one yellow card or warm shadow
+        # can lock the entire match to a wrong team color.
+        if c0 is None:
+            self._c0_bootstrap_buffer.append(float(hue))
+            if len(self._c0_bootstrap_buffer) >= self._c0_bootstrap_required:
+                seed = self._circular_mean_hue(self._c0_bootstrap_buffer)
+                # Degenerate case: buffer contains perfectly-opposed samples
+                # (e.g. team A at hue=10 and team B at hue=100 visible in the
+                # first frames). Circular mean is undefined for an opposed pair;
+                # fall back to the freshest observation so c0 always gets a
+                # starting value, then EMA will continue to refine from there.
+                if seed is None:
+                    seed = self._c0_bootstrap_buffer[-1]
+                self._team_centroids[0] = seed
+            return "other"  # abstain until both seeds are placed
+
+        # c0 exists, c1 does not - look for a bootstrap candidate that is far
+        # enough from c0 in circular hue distance.
+        d = self._hue_distance_circular(hue, c0)
+        if d >= self._team_hue_sep:
+            self._team_centroids[1] = float(hue)
+            return "team_blue"
+        # Otherwise this observation is consistent with c0; fold it in.
+        self._update_team_centroid(0, hue)
+        return "other"
+
+    @staticmethod
+    def _circular_mean_hue(hues):
+        # Circular mean for OpenCV's 0..180 half-circle hue. Doubling the angle
+        # makes the 0/180 wrap behave like a full circle, then atan2 gives the
+        # principal direction. Returns None if the buffer has zero resultant
+        # (perfectly opposed samples, which shouldn't happen in practice).
+        if not hues:
+            return None
+        sx = 0.0
+        cy = 0.0
+        for h in hues:
+            a = float(h) * 2.0 * math.pi / 180.0
+            sx += math.sin(a)
+            cy += math.cos(a)
+        if abs(sx) < 1e-9 and abs(cy) < 1e-9:
+            return None
+        mean_angle = math.atan2(sx, cy)
+        return (mean_angle * 180.0 / (2.0 * math.pi)) % 180.0
 
     def _detect_team_attributes(self, upper_crop_img, track_id):
         h, w = upper_crop_img.shape[:2]
@@ -229,7 +352,14 @@ class TrackVoter:
         cluster_debug = []
         for center, prop in zip(centers, proportions):
             hue, sat, val = map(float, center)
-            category = self._classify_hsv_cluster(hue, sat, val)
+            # Two-pass classification:
+            #   1) static rules catch staff/referee neutrals (centroid-free)
+            #   2) anything else routes through the adaptive team-color path
+            static_cat = self._classify_hsv_cluster(hue, sat, val)
+            if static_cat in {"staff", "referee"}:
+                category = static_cat
+            else:
+                category = self._classify_team_hue(hue, sat, val)
             scores[category] += float(prop)
             cluster_debug.append(
                 {
@@ -534,21 +664,51 @@ class TrackVoter:
             return None
 
         if team_attr == "staff":
+            # Multi-frame debounce: a single staff-colored frame (could be a
+            # shadow, a warm-colored kit, or a frame where K-means happened to
+            # pick up a beige cluster) used to lock the track as "Coach"
+            # permanently. Now require both enough staff observations AND a
+            # dominant share of the track's total votes before locking.
+            team_votes = self.track_team_votes[track_id]
+            staff_count = int(team_votes.get("staff", 0))
+            total_count = max(1, int(sum(team_votes.values())))
             if self._is_sideline_candidate(bbox, frame_shape):
-                self.locked_results[track_id] = "Coach"
-                self._build_locked_meta(track_id, "Coach", team="staff", status="coach")
-                self._set_track_state(track_id, "Coach", "staff", "coach", 1.0)
-                self._log(f"[身份锁定] Track {track_id} -> Coach")
-                return "Coach"
+                if (staff_count >= self._identity_lock_min_frames
+                        and staff_count >= self._identity_dominant_ratio * total_count):
+                    self.locked_results[track_id] = "Coach"
+                    self._build_locked_meta(track_id, "Coach", team="staff", status="coach")
+                    self._set_track_state(track_id, "Coach", "staff", "coach", 1.0)
+                    self._log(f"[身份锁定] Track {track_id} -> Coach | staff_frames={staff_count}/{total_count}")
+                    return "Coach"
+                self._log(
+                    f"[身份待定] Track {track_id} staff待确认 | staff_frames={staff_count}/{total_count} "
+                    f"(需要≥{self._identity_lock_min_frames}且≥{self._identity_dominant_ratio:.0%})"
+                )
+                self._set_track_state(track_id, None, "staff", "candidate", 0.0)
+                return None
             self._set_track_state(track_id, None, "staff", "filtered", 0.0)
             return None
 
         if team_attr == "referee":
-            self.locked_results[track_id] = "Referee"
-            self._build_locked_meta(track_id, "Referee", team="referee", status="referee")
-            self._set_track_state(track_id, "Referee", "referee", "referee", 1.0)
-            self._log(f"[身份锁定] Track {track_id} -> Referee")
-            return "Referee"
+            # Multi-frame debounce: a single yellow-saturated frame (could be
+            # an advertising board, a yellow card, a high-visibility vest in
+            # the background) used to lock "Referee" for the whole match.
+            team_votes = self.track_team_votes[track_id]
+            ref_count = int(team_votes.get("referee", 0))
+            total_count = max(1, int(sum(team_votes.values())))
+            if (ref_count >= self._identity_lock_min_frames
+                    and ref_count >= self._identity_dominant_ratio * total_count):
+                self.locked_results[track_id] = "Referee"
+                self._build_locked_meta(track_id, "Referee", team="referee", status="referee")
+                self._set_track_state(track_id, "Referee", "referee", "referee", 1.0)
+                self._log(f"[身份锁定] Track {track_id} -> Referee | ref_frames={ref_count}/{total_count}")
+                return "Referee"
+            self._log(
+                f"[身份待定] Track {track_id} referee待确认 | ref_frames={ref_count}/{total_count} "
+                f"(需要≥{self._identity_lock_min_frames}且≥{self._identity_dominant_ratio:.0%})"
+            )
+            self._set_track_state(track_id, None, "referee", "candidate", 0.0)
+            return None
 
         if self.recognizer_type == "paddle":
             number, confidence = self._infer_paddle(upper_crop, track_id)

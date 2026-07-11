@@ -131,7 +131,7 @@ def _run_global_number_arbitration(meta_files, arbitration_file):
     detections = []
     track_records = {}
     conflicts = []
-    global_roster = {"team_red": {}, "team_blue": {}}
+    roster_teams = ("team_red", "team_blue")
 
     for meta_file in meta_files:
         if not os.path.exists(meta_file):
@@ -148,52 +148,64 @@ def _run_global_number_arbitration(meta_files, arbitration_file):
             record["source_meta"] = os.path.basename(meta_file)
             track_records[track_uid] = record
 
+    # 冲突判定按“片段内”作用域：同一 clip 内两条不同轨迹抢同队同号才是真冲突
+    # （球衣误读，二者只有一个能保留号码）。三段抽样会让同一名球员在不同 clip
+    # 反复出现并锁到相同号码，那是同一个人，必须合并而非判为冲突。
+    chunk_champion = {}  # (team, chunk_idx, number) -> record（该 clip 内当前擂主）
+
     for track_uid, record in track_records.items():
         team = record.get("team")
         label = str(record.get("label", ""))
-        if team not in global_roster or not label.isdigit():
+        if team not in roster_teams or not label.isdigit():
             continue
 
-        team_bucket = global_roster[team]
+        # Default missing chunk_idx to -1 so legacy/manual records (which lack
+        # the chunk scope) form their own conflict bucket instead of colliding
+        # with each other under key (team, None, label).
+        chunk_idx = record.get("chunk_idx")
+        if chunk_idx is None:
+            chunk_idx = -1
         metric = float(record.get("metric", 0.0))
-        existing = team_bucket.get(label)
+        key = (team, chunk_idx, label)
+        existing = chunk_champion.get(key)
 
         if existing is None:
-            team_bucket[label] = record
+            chunk_champion[key] = record
             continue
 
-        existing_metric = float(existing.get("metric", 0.0))
-        if metric > existing_metric:
-            existing["resolved_label"] = "num?"
-            existing["status"] = "conflict"
-            existing["conflict_with"] = track_uid
-            conflicts.append(
-                {
-                    "team": team,
-                    "number": label,
-                    "winner_track_uid": track_uid,
-                    "loser_track_uid": str(existing["track_uid"]),
-                }
-            )
-            team_bucket[label] = record
+        if metric > float(existing.get("metric", 0.0)):
+            winner, loser = record, existing
         else:
-            record["resolved_label"] = "num?"
-            record["status"] = "conflict"
-            record["conflict_with"] = str(existing["track_uid"])
-            conflicts.append(
-                {
-                    "team": team,
-                    "number": label,
-                    "winner_track_uid": str(existing["track_uid"]),
-                    "loser_track_uid": track_uid,
-                }
-            )
+            winner, loser = existing, record
+
+        loser["resolved_label"] = "num?"
+        loser["status"] = "conflict"
+        loser["conflict_with"] = str(winner["track_uid"])
+        conflicts.append(
+            {
+                "team": team,
+                "chunk_idx": chunk_idx,
+                "number": label,
+                "winner_track_uid": str(winner["track_uid"]),
+                "loser_track_uid": str(loser["track_uid"]),
+            }
+        )
+        chunk_champion[key] = winner
+
+    # 名单按“保留了号码”的轨迹汇总；同号跨 clip 的多条轨迹全部计入（同一名球员）。
+    global_roster = {team: {} for team in roster_teams}
+    for track_uid in sorted(track_records):
+        record = track_records[track_uid]
+        team = record.get("team")
+        if team not in global_roster:
+            continue
+        label = str(record.get("resolved_label", "") or "")
+        if not label.isdigit():
+            continue
+        global_roster[team].setdefault(label, []).append(str(record["track_uid"]))
 
     result = {
-        "global_roster": {
-            team: {number: info["track_uid"] for number, info in bucket.items()}
-            for team, bucket in global_roster.items()
-        },
+        "global_roster": global_roster,
         "tracks": [track_records[k] for k in sorted(track_records)],
         "conflicts": conflicts,
         "num_detections": len(detections),
