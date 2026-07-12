@@ -4,6 +4,7 @@ import json
 import multiprocessing as mp
 import os
 import subprocess
+import uuid
 import torch
 from collections import defaultdict
 from dataclasses import dataclass
@@ -415,7 +416,7 @@ def _cleanup_files(file_paths):
 
 
 
-def process_chunk(config, gpu_id, start_frame, end_frame, chunk_idx, meta_file, width, height):
+def process_chunk(config, gpu_id, start_frame, end_frame, chunk_idx, meta_file, width, height, run_id=""):
     from codetr_detector import CoDetrDetector
     from football_tracker import FootballTracker
     from voter import TrackVoter
@@ -455,7 +456,7 @@ def process_chunk(config, gpu_id, start_frame, end_frame, chunk_idx, meta_file, 
         for det_idx, t in enumerate(tracks):
             x1, y1, x2, y2, tid, score, cls, idx = t
             x1, y1, x2, y2, tid, cls = map(int, [x1, y1, x2, y2, tid, cls])
-            track_uid = f"{chunk_idx}:{tid}"
+            track_uid = f"{run_id}:c{chunk_idx}:p{tid}"
 
             if cls == 0:
                 crop_y1, crop_y2 = max(0, y1), min(height, y2)
@@ -495,7 +496,7 @@ def process_chunk(config, gpu_id, start_frame, end_frame, chunk_idx, meta_file, 
                         "frame_id": int(frame_id),
                         "chunk_idx": int(chunk_idx),
                         "track_id": int(tid),
-                        "track_uid": f"{chunk_idx}:ball:{frame_id}:{det_idx}",
+                        "track_uid": f"{run_id}:c{chunk_idx}:b{frame_id}:{det_idx}",
                         "bbox": [int(x1), int(y1), int(x2), int(y2)],
                         "team": "ball",
                         "number": "Ball",
@@ -512,12 +513,13 @@ def process_chunk(config, gpu_id, start_frame, end_frame, chunk_idx, meta_file, 
     for item in exported.get("locked_tracks", []):
         record = dict(item)
         record["chunk_idx"] = int(chunk_idx)
-        record["track_uid"] = f"{chunk_idx}:{record['track_id']}"
+        record["track_uid"] = f"{run_id}:c{chunk_idx}:t{record['track_id']}"
         locked_tracks.append(record)
 
     with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(
             {
+                "run_id": run_id,
                 "chunk_idx": int(chunk_idx),
                 "frame_range": [int(start_frame), int(end_frame)],
                 "detections": detections,
@@ -619,7 +621,7 @@ def _validate_runtime_configuration(config):
     _validate_ocr_runtime(config)
 
 
-def _run_inference_jobs(config, clips, width, height):
+def _run_inference_jobs(config, clips, width, height, run_id=""):
     mp.set_start_method("spawn", force=True)
 
     meta_files = []
@@ -639,11 +641,11 @@ def _run_inference_jobs(config, clips, width, height):
             gpu_id = config.gpus[local_idx]
 
             if max_parallel == 1:
-                process_chunk(config, gpu_id, start_f, end_f, chunk_idx, meta_file, width, height)
+                process_chunk(config, gpu_id, start_f, end_f, chunk_idx, meta_file, width, height, run_id=run_id)
             else:
                 p = mp.Process(
                     target=process_chunk,
-                    args=(config, gpu_id, start_f, end_f, chunk_idx, meta_file, width, height),
+                    args=(config, gpu_id, start_f, end_f, chunk_idx, meta_file, width, height, run_id),
                 )
                 p.start()
                 processes.append(p)
@@ -686,6 +688,8 @@ def _build_runtime_config(args):
 
 
 def _run_sample3_pipeline(config):
+    run_id = uuid.uuid4().hex[:8]
+    print(f"[系统] 本次流水线 RUN_ID = {run_id}")
     naming = _build_output_naming_context(config.input_video)
     output_video = _build_sample3_output_video_path(
         config.output_dir,
@@ -699,7 +703,7 @@ def _run_sample3_pipeline(config):
     clips = _compute_three_middle_clips(total_frames, fps, config.clip_seconds)
     _print_sample3_clips(clips, fps)
 
-    meta_files = _run_inference_jobs(config, clips, width, height)
+    meta_files = _run_inference_jobs(config, clips, width, height, run_id=run_id)
 
     arbitration_file = _build_sample3_arbitration_path(
         config.output_dir,
